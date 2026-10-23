@@ -1,0 +1,4 @@
+# Match the USB device and HID interface in separate rules: ATTRS on one rule
+# must refer to the same parent, but these attributes live on different parents.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="2105", ENV{.NZXT_FUNCTION_KEYS}="1"
+SUBSYSTEM=="hidraw", ENV{.NZXT_FUNCTION_KEYS}=="1", ATTRS{bInterfaceNumber}=="01", TAG+="uaccess", SYMLINK+="nzxt-function-lighting"

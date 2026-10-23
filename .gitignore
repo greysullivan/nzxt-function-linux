@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.private.json
+research/*
+!research/captures.py
+!research/inspect_profiles.py
+!research/README.md
+setup-terminal

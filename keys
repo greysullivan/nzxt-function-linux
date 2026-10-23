@@ -1,0 +1,571 @@
+#!/usr/bin/python3
+"""Native lighting scenes for the original NZXT Function MiniTKL (1e71:2105)."""
+import contextlib
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import stat
+import struct
+import sys
+import tempfile
+import time
+
+COLOURS = {
+    'pink': '#DFA0A0', 'rose': '#DFA0A0', 'red': '#E05A5A',
+    'orange': '#F28C28', 'amber': '#D6A52A', 'yellow': '#D6C84A',
+    'lime': '#91B84A', 'green': '#55A878', 'teal': '#42A99A',
+    'cyan': '#45AFC2', 'blue': '#5C91D6', 'indigo': '#7566CF',
+    'purple': '#9B68C7', 'violet': '#B36AB5', 'magenta': '#D45A9C',
+    'white': '#E8E8E8',
+}
+SCENES = {1: 'still', 2: 'onboard2', 3: 'onboard3', 4: 'impact'}
+MODES = {1: 'solid', 2: 'onboard', 3: 'onboard', 4: 'ripple'}
+MANAGED_SLOTS = (1, 4)
+DESCRIPTOR = bytes.fromhex(
+    '06caff0901a10185430900150026ff007508953f8100'
+    '85430900150026ff007508953f9100c0')
+MASK = bytes.fromhex('ff ff ff 5f ff ff ff 7f ff 6f 27 7e fb 67 fe 7f 00 08')
+SYSFS = Path('/sys/class/hidraw')
+DEV = Path('/dev')
+STATE = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'keyboard-rgb'
+THEME = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'air-theme/palette.json'
+HELP = '''Usage:
+  keys <name|hex>       Set the shared base colour, retaining the scene
+  keys-pink            Colour shortcut, like theme-pink
+  keys off             Disable lighting in managed slots F1/F4
+  keys theme [PATH]    Follow a JSON palette's accent; default: air-theme
+  keys scene 1|4       Apply Still/Impact with the matching FN slot selected
+  keys scene impact    Scene names: still and impact (F2/F3 stay onboard)
+  keys slots on|off    Follow FN slots; customize only F1 and F4
+  keys effect auto     Use the theme foreground, or neutral white/charcoal
+  keys effect <colour> Override reactive colour with a name or hex value
+  keys speed 1..100    Set F4's native reactive-effect speed (default 45)
+  keys restore-defaults Restore F2 rainbow wave and F3 colour shift (lighting)
+  keys status          Show settings, access and restoration service
+
+Six-digit hex colours accept an optional # (quote it in the shell).
+Names: ''' + ', '.join(COLOURS) + '''
+
+F1 stays solid; F2/F3 use their saved onboard effects; F4 adds a fixed-colour
+ripple over the shared base. No complementary/rainbow colour cycling is added.
+FN following applies managed scenes within about 0.5s. Animations run onboard.
+It does not permanently save scenes into onboard profile memory.
+Successful settings are restored on login/reconnect. Fixed colours are
+independent of the desktop; keys theme explicitly enables theme following.
+'''
+
+
+class KeysError(Exception):
+    pass
+
+
+def parse_colour(value):
+    value = value.lower()
+    if value in ('off', 'black'):
+        return 'off'
+    if value in COLOURS:
+        return COLOURS[value]
+    if re.fullmatch(r'#?[0-9a-f]{6}', value):
+        colour = '#' + value.lstrip('#').upper()
+        return 'off' if colour == '#000000' else colour
+    raise KeysError(f'Unknown colour {value!r}. Use a listed name or six hex digits (keys --help).')
+
+
+def report_for(colour, slot=1):
+    if type(slot) is not int or slot not in SCENES:
+        raise KeysError('Lighting slot must be 1..4.')
+    if colour == 'off':
+        return bytes([0x43, 0x82, 0, 0x32, slot - 1]).ljust(64, b'\0')
+    # Capture-backed solid mode: command 0x30, mode 1, key mask, RGB.
+    return (bytes([0x43, 0x98, 0, 0x30, slot - 1, 1]) + MASK
+            + bytes.fromhex(colour.removeprefix('#'))).ljust(64, b'\0')
+
+
+def reactive_report(mode, colour, speed=70, slot=1):
+    if type(slot) is not int or slot not in SCENES:
+        raise KeysError('Lighting slot must be 1..4.')
+    if mode == 'solid':
+        return bytes([0x43, 0x82, 0, 0x39, slot - 1]).ljust(64, b'\0')
+    if mode not in ('fade', 'line', 'ripple') or not 1 <= speed <= 100:
+        raise KeysError('Invalid reactive mode or speed.')
+    rgb = bytes.fromhex(colour.removeprefix('#'))
+    if len(rgb) != 3:
+        raise KeysError('Reactive colour must have three RGB bytes.')
+    mode_id = {'ripple': 7, 'fade': 8, 'line': 9}[mode]
+    parameters = bytes([speed, 0]) + (b'\x02' if mode == 'fade' else b'\x03\x02') + rgb
+    payload = bytes([0x37, slot - 1, mode_id]) + MASK + parameters
+    return (bytes([0x43, 0x80 | len(payload), 0]) + payload).ljust(64, b'\0')
+
+
+def factory_report(slot):
+    # Captured stock base definitions returned by 0x31 for profiles 1 and 2.
+    # This is a lighting-only restoration, not a whole-keyboard factory reset.
+    if slot == 2:
+        payload = bytes.fromhex('30 01 05') + b'\xff' * 18 + bytes.fromhex('01 0a 01 00')
+    elif slot == 3:
+        payload = (bytes.fromhex('30 02 03') + b'\xff' * 18
+                   + bytes.fromhex('14 03 05 80 00 80 00 00 00 ff 14 00 ff ff 28 ff ff 00 3c ff 00 00 50'))
+    else:
+        raise KeysError('Factory-style restoration is limited to F2 and F3.')
+    return (bytes([0x43, 0x80 | len(payload), 0]) + payload).ljust(64, b'\0')
+
+
+def restore_defaults():
+    with locked(), lighting_fd() as (fd, _):
+        for slot in (2, 3):
+            report = factory_report(slot)
+            exchange(fd, report)
+            exchange(fd, reactive_report('solid', '#000000', slot=slot))
+            length = report[1] & 0x7f
+            actual = exchange(fd, bytes([0x43, 0x82, 0, 0x31, slot-1]).ljust(64, b'\0'), reply_size=length)
+            expected = b'\x01' + report[4:3 + length]
+            if actual != expected:
+                raise KeysError(f'F{slot} base readback did not match the restored definition.')
+            reactive = exchange(fd, bytes([0x43, 0x82, 0, 0x38, slot-1]).ljust(64, b'\0'), reply_size=2)
+            if reactive != bytes([2, slot-1]):
+                raise KeysError(f'F{slot} still has a reactive overlay after restoration.')
+    print('Restored F2 rainbow wave and F3 colour shift; both read back correctly. F1/F4 unchanged.')
+
+
+def paired_colour(base, settings=None):
+    # F4 uses one fixed palette foreground, not an opposite hue or rainbow.
+    foreground, background = '#FFFFFF', '#343434'
+    if settings is not None and settings['base'] == 'theme':
+        try:
+            palette = json.loads(Path(settings['theme_path']).read_text())
+            for token in ('foreground', 'background'):
+                value = palette.get(token)
+                if isinstance(value, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', value):
+                    if token == 'foreground':
+                        foreground = value.upper()
+                    else:
+                        background = value.upper()
+        except (OSError, ValueError, AttributeError):
+            pass
+    distance = max(abs(int(foreground[i:i+2], 16) - int(base[i:i+2], 16)) for i in (1, 3, 5))
+    return background if distance <= 32 else foreground
+
+
+def discover():
+    matches = []
+    for node in sorted(SYSFS.glob('hidraw*')):
+        try:
+            hid = (node / 'device').resolve(strict=True)
+            fields = dict(line.split('=', 1) for line in (hid / 'uevent').read_text().splitlines() if '=' in line)
+            if fields.get('HID_ID') != '0003:00001E71:00002105':
+                continue
+            if (hid / 'report_descriptor').read_bytes() != DESCRIPTOR:
+                continue
+            if (hid.parent / 'bInterfaceNumber').read_text().strip() != '01':
+                continue
+            matches.append((DEV / node.name, str(hid)))
+        except (OSError, ValueError):
+            continue  # A device may disappear during enumeration.
+    if not matches:
+        raise KeysError('NZXT Function MiniTKL lighting interface not found. Check its USB connection.')
+    if len(matches) != 1:
+        raise KeysError('Multiple NZXT MiniTKL lighting interfaces found; connect only one keyboard.')
+    return matches[0]
+
+
+def validate_fd(fd):
+    if not stat.S_ISCHR(os.fstat(fd).st_mode):
+        raise KeysError('Lighting path is not a character device.')
+    raw_info = bytearray(8)
+    fcntl.ioctl(fd, 0x80084803, raw_info, True)  # HIDIOCGRAWINFO
+    if struct.unpack('=IHH', raw_info) != (3, 0x1e71, 0x2105):
+        raise KeysError('HID device identity changed; refusing to write.')
+    size_buffer = bytearray(4)
+    fcntl.ioctl(fd, 0x80044801, size_buffer, True)  # HIDIOCGRDESCSIZE
+    size = struct.unpack('=I', size_buffer)[0]
+    if size != len(DESCRIPTOR):
+        raise KeysError('HID descriptor size is not the MiniTKL lighting interface.')
+    descriptor = bytearray(4100)
+    struct.pack_into('=I', descriptor, 0, size)
+    fcntl.ioctl(fd, 0x90044802, descriptor, True)  # HIDIOCGRDESC
+    if bytes(descriptor[4:4 + size]) != DESCRIPTOR:
+        raise KeysError('HID report descriptor is not the MiniTKL lighting interface.')
+
+
+def exchange(fd, report, timeout=1.5, reply_size=None):
+    # Discard old reports, with a cap so another client cannot stall us forever.
+    for _ in range(64):
+        try:
+            if not os.read(fd, 64):
+                raise KeysError('Keyboard disconnected before the command.')
+        except BlockingIOError:
+            break
+    else:
+        raise KeysError('Lighting interface is busy; close other RGB controllers.')
+    if os.write(fd, report) != 64:
+        raise KeysError('Incomplete HID write; colour was not saved.')
+    deadline = time.monotonic() + timeout
+    echoed = False
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], max(0, left))[0]:
+            raise KeysError('Keyboard did not acknowledge the lighting command; colour was not saved.')
+        try:
+            reply = os.read(fd, 64)
+        except BlockingIOError:
+            continue
+        if not reply:
+            raise KeysError('Keyboard disconnected during the command; colour was not saved.')
+        if len(reply) != 64 or reply[0] != 0x43:
+            raise KeysError('Unexpected HID response; colour was not saved.')
+        # The first response echoes the submitted command; it is not success.
+        if reply[1] == 0xe5 and reply[2:] == report[2:]:
+            echoed = True
+            continue
+        if echoed and reply_size is not None and reply[:3] == bytes([0x43, 0x80 | reply_size, 0]):
+            return reply[3:3 + reply_size]
+        if echoed and reply_size is None and reply[:3] == bytes.fromhex('43 82 00'):
+            # The result is one byte. Byte 4 retains the command parameter
+            # (the profile index for lighting), not the high byte of an error.
+            if reply[3] == 1:
+                return
+            raise KeysError(f'Keyboard rejected the command ({reply[3]:02x}); colour was not saved.')
+        raise KeysError('Unexpected command acknowledgement; close other RGB controllers.')
+
+
+@contextlib.contextmanager
+def lighting_fd(device=None):
+    path, identity = device if device is not None else discover()
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            validate_fd(fd)
+            yield fd, identity
+        finally:
+            os.close(fd)
+    except PermissionError as exc:
+        raise KeysError('No access to the lighting interface. Install the supplied udev rule and use an active local login.') from exc
+    except OSError as exc:
+        raise KeysError(f'Keyboard I/O failed: {exc.strerror or exc}. Colour was not saved.') from exc
+
+
+def query_slot(fd):
+    # Register 0x44 is captured in CAM startup traffic. On this MiniTKL it
+    # returned 00, 01, 02, 03 when FN+F1, F2, F3, F4 were physically selected.
+    reply = exchange(fd, bytes.fromhex('43 81 00 44').ljust(64, b'\0'), reply_size=1)
+    if reply[0] not in range(4):
+        raise KeysError(f'Unexpected onboard slot index {reply[0]}; refusing to select a scene.')
+    return reply[0] + 1
+
+
+def get_slot(device=None):
+    with lighting_fd(device) as (fd, _):
+        return query_slot(fd)
+
+
+def apply_colour(colour, device=None):
+    # Compatibility entrypoint for the original static command and tests.
+    with lighting_fd(device) as (fd, identity):
+        slot = query_slot(fd)
+        if slot not in MANAGED_SLOTS:
+            return identity
+        exchange(fd, report_for(colour, slot))
+        exchange(fd, reactive_report('solid', '#000000', slot=slot))
+        return identity
+
+
+def apply_scene(settings, device=None):
+    settings = dict(settings)
+    colour = resolve_base(settings)
+    effect = paired_colour(colour, settings) if settings['effect'] == 'auto' and colour != 'off' else settings['effect']
+    with lighting_fd(device) as (fd, identity):
+        slot = query_slot(fd)
+        settings['scene'] = slot
+        if slot not in MANAGED_SLOTS:
+            return dict(settings, colour=colour, passthrough=True), identity
+        mode = 'solid' if colour == 'off' else MODES[settings['scene']]
+        exchange(fd, report_for(colour, slot))
+        exchange(fd, reactive_report(mode, effect, settings['speed'], slot))
+    result = dict(settings, colour=colour, passthrough=False)
+    return result, identity
+
+
+@contextlib.contextmanager
+def locked():
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(STATE / 'lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        until = time.monotonic() + 6
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= until:
+                    raise KeysError('Another keyboard command is still running. Try again shortly.')
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_state():
+    try:
+        data = json.loads((STATE / 'state.json').read_text())
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError) as exc:
+        raise KeysError(f'Cannot read saved keyboard colour: {exc}') from exc
+    if (not isinstance(data, dict) or data.get('version') not in (1, 2)
+            or not isinstance(data.get('colour'), str)
+            or not re.fullmatch(r'off|#[0-9A-F]{6}', data['colour'])):
+        raise KeysError('Saved keyboard colour is invalid. Move state.json aside and select a colour again.')
+    if data['version'] == 1:
+        data = dict(data, version=2, base=data['colour'], scene=1, effect='auto',
+                    speed=70, follow_slots=False, theme_path=str(THEME))
+    if (not isinstance(data.get('base'), str)
+            or not re.fullmatch(r'theme|off|#[0-9A-F]{6}', data['base'])
+            or type(data.get('scene')) is not int or data['scene'] not in SCENES
+            or not isinstance(data.get('effect'), str)
+            or not re.fullmatch(r'auto|#[0-9A-F]{6}', data['effect'])
+            or type(data.get('speed')) is not int or not 1 <= data['speed'] <= 100
+            or type(data.get('follow_slots')) is not bool
+            or not isinstance(data.get('theme_path'), str) or not data['theme_path']):
+        raise KeysError('Saved scene settings are invalid. Check the state file before changing lighting.')
+    return data
+
+
+def default_settings():
+    base = 'theme' if THEME.is_file() else COLOURS['white']
+    return {'version': 2, 'base': base, 'colour': COLOURS['white'], 'scene': 1,
+            'effect': 'auto', 'speed': 45, 'follow_slots': False, 'theme_path': str(THEME)}
+
+
+def resolve_base(settings):
+    if settings['base'] != 'theme':
+        return settings['base']
+    try:
+        palette = json.loads(Path(settings['theme_path']).read_text())
+        value = palette.get('accent') if isinstance(palette, dict) else None
+        if not isinstance(value, str) or not re.fullmatch(r'#?[0-9a-fA-F]{6}', value):
+            raise ValueError('expected an accent field with six hex digits')
+        return parse_colour(value)
+    except (OSError, ValueError) as exc:
+        raise KeysError(f"Cannot read theme accent from {settings['theme_path']}: {exc}") from exc
+
+
+def save_state(settings, label=None):
+    # Accept the v1 helper signature used by early diagnostic tools.
+    if isinstance(settings, str):
+        settings = dict(default_settings(), base=settings, colour=settings, label=label)
+    data = dict(settings, version=2,
+                updated_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=STATE, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(data, indent=2) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, STATE / 'state.json')
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return data
+
+
+def configure(change):
+    with locked():
+        previous = read_state()
+        settings = dict(previous or default_settings())
+        change(settings)
+        resolve_base(settings)  # Invalid/missing palettes must never cause I/O.
+        if settings['follow_slots']:
+            settings['scene'] = get_slot()
+        try:
+            result, _ = apply_scene(settings)
+        except KeysError:
+            # A scene is two lighting commands. Best-effort rollback if the
+            # second failed; failed settings never replace the saved selection.
+            if previous is not None:
+                try:
+                    apply_scene(previous)
+                except KeysError:
+                    pass
+            raise
+        save_state(result)
+    following = 'following FN slots' if result['follow_slots'] else 'manual scene'
+    if result.get('passthrough'):
+        print(f"FN+F{result['scene']} left unchanged. Settings saved for F1/F4.")
+        return
+    print(f"Keys: {result['colour']}, {SCENES[result['scene']]} ({following}). Saved.")
+
+
+def choose(value):
+    colour = parse_colour(value)
+    configure(lambda settings: settings.update(base=colour, label=value.lower()))
+
+
+class Restorer:
+    def __init__(self):
+        self.device = None
+        self.signature = None
+        self.error = None
+
+    def step(self):
+        # The lock covers discovery, state read and I/O: a foreground command
+        # cannot be overwritten by an old value during restoration.
+        with locked():
+            state = read_state()
+            if state is None:
+                return
+            device = discover()
+            desired = dict(state)
+            if state['follow_slots']:
+                desired['scene'] = get_slot(device)
+                if desired['scene'] not in MANAGED_SLOTS:
+                    signature = (device[1], 'onboard', desired['scene'])
+                    if signature != self.signature:
+                        print(f"FN+F{desired['scene']} left to onboard preset", flush=True)
+                    self.signature = signature
+                    self.device = device[1]
+                    self.error = None
+                    return
+            base = resolve_base(desired)
+            effect = paired_colour(base, desired) if desired['effect'] == 'auto' and base != 'off' else desired['effect']
+            signature = (device[1], desired['scene'], base, effect, desired['speed'])
+            if signature != self.signature:
+                result, _ = apply_scene(desired, device)
+                save_state(result)
+                self.device = device[1]
+                self.signature = signature
+                print(f"Applied {result['colour']} / {SCENES[result['scene']]} on {device[0]}", flush=True)
+            self.error = None
+
+    def failed(self, exc):
+        # Reset even when a removal was observed between two enumeration passes.
+        self.device = None
+        self.signature = None
+        message = str(exc)
+        if message != self.error:
+            print(f'Waiting to restore keyboard: {message}', file=sys.stderr, flush=True)
+            self.error = message
+
+
+def watch():
+    restorer = Restorer()
+    running = True
+
+    def stop(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while running:
+        try:
+            restorer.step()
+        except (KeysError, OSError) as exc:
+            restorer.failed(exc)
+        time.sleep(.5)
+
+
+def status():
+    import subprocess
+    with locked():
+        saved = read_state()
+    print('Saved colour: ' + (saved['colour'] if saved else 'none; select a colour first'))
+    if saved:
+        print(f"Scene: {saved['scene']} / {SCENES[saved['scene']]} ({MODES[saved['scene']]})")
+        print('Base source: ' + ('theme: ' + saved['theme_path'] if saved['base'] == 'theme' else 'fixed colour'))
+        if saved['colour'] != 'off':
+            effect = paired_colour(saved['colour'], saved) if saved['effect'] == 'auto' else saved['effect']
+            print(f"Reactive colour: {effect} ({saved['effect']}); speed: {saved['speed']}")
+        print('Follow FN+F1..F4: ' + ('yes' if saved['follow_slots'] else 'no'))
+        print('Last successful application: ' + str(saved.get('updated_at', 'unknown')))
+    try:
+        path, _ = discover()
+        print(f"Keyboard: {path} ({'read/write access' if os.access(path, os.R_OK | os.W_OK) else 'permission required'})")
+        with locked():
+            slot = get_slot()
+        print(f"Active FN slot: F{slot}" + (' (onboard preset, unmanaged)' if slot not in MANAGED_SLOTS else ''))
+    except KeysError as exc:
+        print(f'Keyboard: {exc}')
+    try:
+        result = subprocess.run(['systemctl', '--user', 'is-active', 'keyboard-rgb.service'],
+                                capture_output=True, text=True, timeout=3)
+        print('Automatic restoration: ' + (result.stdout.strip() or 'unavailable'))
+    except (OSError, subprocess.TimeoutExpired):
+        print('Automatic restoration: unavailable')
+    print('Scenes are applied by Linux; onboard profile memory is not programmed.')
+
+
+def main():
+    args = sys.argv[1:]
+    invoked = Path(sys.argv[0]).name
+    if invoked.startswith('keys-') and invoked[5:] in {*COLOURS, 'off'} and not args:
+        args = [invoked[5:]]
+    elif invoked.startswith('keys-') and invoked[5:] in SCENES.values() and not args:
+        args = ['scene', invoked[5:]]
+    if args in ([], ['-h'], ['--help']):
+        print(HELP)
+        return 0 if args else 2
+    try:
+        if args == ['--watch']:
+            watch()
+        elif args == ['status']:
+            status()
+        elif args == ['restore-defaults']:
+            restore_defaults()
+        elif args[0] == 'theme' and len(args) in (1, 2):
+            path = str(Path(args[1]).expanduser().absolute()) if len(args) == 2 else str(THEME)
+            configure(lambda settings: settings.update(base='theme', theme_path=path))
+        elif len(args) == 2 and args[0] == 'scene':
+            aliases = {name: number for number, name in SCENES.items() if number in MANAGED_SLOTS}
+            aliases.update({str(number): number for number in MANAGED_SLOTS})
+            if args[1] not in aliases:
+                raise ValueError('Choose 1/still or 4/impact; F2/F3 keep onboard effects.')
+            def select_scene(settings):
+                scene = aliases[args[1]]
+                if get_slot() != scene:
+                    raise KeysError(f'Press FN+F{scene} first, then apply this scene.')
+                settings.update(scene=scene, follow_slots=False)
+            configure(select_scene)
+        elif len(args) == 2 and args[0] == 'slots' and args[1] in ('on', 'off'):
+            configure(lambda settings: settings.update(follow_slots=args[1] == 'on'))
+        elif len(args) == 2 and args[0] == 'effect':
+            try:
+                effect = 'auto' if args[1] == 'auto' else parse_colour(args[1])
+            except KeysError as exc:
+                raise ValueError(str(exc)) from exc
+            if effect == 'off':
+                effect = '#000000'
+            configure(lambda settings: settings.update(effect=effect))
+        elif len(args) == 2 and args[0] == 'speed':
+            speed = int(args[1])
+            if not 1 <= speed <= 100:
+                raise ValueError('Speed must be between 1 and 100.')
+            configure(lambda settings: settings.update(speed=speed))
+        elif len(args) != 1:
+            raise ValueError('Invalid arguments. See keys --help.')
+        else:
+            # Validate before lock creation or device enumeration.
+            try:
+                parse_colour(args[0])
+            except KeysError as exc:
+                print(f'keys: {exc}', file=sys.stderr)
+                return 2
+            choose(args[0])
+    except ValueError as exc:
+        print(f'keys: {exc}', file=sys.stderr)
+        return 2
+    except (KeysError, OSError) as exc:
+        print(f'keys: {exc}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

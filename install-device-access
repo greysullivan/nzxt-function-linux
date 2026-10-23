@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+if [ "$(id -u)" -ne 0 ]; then
+    echo 'Run this installer with sudo.' >&2
+    exit 1
+fi
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+install -m 0644 "$project_dir/70-nzxt-function-keys.rules" /etc/udev/rules.d/70-nzxt-function-keys.rules
+udevadm control --reload-rules
+for device in /sys/class/hidraw/hidraw*; do
+    if [ -r "$device/device/uevent" ] && grep -q '^HID_ID=0003:00001E71:00002105$' "$device/device/uevent"; then
+        udevadm trigger --action=add "$device"
+    fi
+done
+udevadm settle --timeout=10
+echo 'Installed access rule for the NZXT MiniTKL lighting interface.'

@@ -1,0 +1,13 @@
+[Unit]
+Description=NZXT MiniTKL lighting, FN scenes and theme following
+
+[Service]
+ExecStart=%h/.local/bin/keys --watch
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=8
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
