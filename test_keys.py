@@ -121,8 +121,10 @@ class ProtocolTests(unittest.TestCase):
         if not theme.is_file():
             self.skipTest('Optional local air-theme integration is not installed')
         tree = ast.parse(theme.read_text())
-        palette = next(ast.literal_eval(node.value) for node in tree.body
-                       if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'COLOURS' for t in node.targets))
+        palette = next((ast.literal_eval(node.value) for node in tree.body
+                        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'COLOURS' for t in node.targets)), None)
+        if palette is None:
+            self.skipTest('Installed theme does not expose the optional COLOURS palette')
         self.assertEqual(keys.COLOURS, palette)
 
     def test_input_validation(self):
