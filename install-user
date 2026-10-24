@@ -14,7 +14,7 @@ for obsolete in trace sweep; do
         unlink "$shortcut"
     fi
 done
-for colour in pink rose red orange amber yellow lime green teal cyan blue indigo purple violet magenta white off still impact; do
+for colour in red crimson orange amber gold yellow lime chartreuse green emerald teal turquoise cyan sky-blue azure blue royal-blue navy indigo purple violet magenta hot-pink pink rose white off still impact; do
     shortcut="$HOME/.local/bin/keys-$colour"
     if [ -e "$shortcut" ] || [ -L "$shortcut" ]; then
         if [ "$(readlink "$shortcut" 2>/dev/null || true)" != keys ]; then

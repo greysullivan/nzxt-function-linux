@@ -115,20 +115,26 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(keys.paired_colour(keys.COLOURS['white']), '#343434')
         self.assertRegex(keys.paired_colour('#336699'), r'^#[0-9A-F]{6}$')
 
-    def test_theme_names_still_match_installed_theme(self):
-        import ast
-        theme = Path.home() / '.local/bin/theme'
-        if not theme.is_file():
-            self.skipTest('Optional local air-theme integration is not installed')
-        tree = ast.parse(theme.read_text())
-        palette = next((ast.literal_eval(node.value) for node in tree.body
-                        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'COLOURS' for t in node.targets)), None)
-        if palette is None:
-            self.skipTest('Installed theme does not expose the optional COLOURS palette')
-        self.assertEqual(keys.COLOURS, palette)
+    def test_named_primaries_match_captured_full_intensity_reports(self):
+        for name in ('red', 'green', 'blue'):
+            captured = [bytes.fromhex(p['report']) for p in FIXTURES['static'][name] if p['endpoint'] == 2]
+            self.assertEqual(captured, [keys.report_for(keys.parse_colour(name))])
+
+    def test_colour_listing_does_not_access_hardware_or_settings(self):
+        for command in ('colours', 'colors', 'list'):
+            output = io.StringIO()
+            with patch.object(keys.sys, 'argv', ['keys', command]), \
+                    patch.object(keys, 'discover') as discover, patch.object(keys, 'locked') as locked, \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(keys.main(), 0)
+            discover.assert_not_called()
+            locked.assert_not_called()
+            listed = dict(line.split() for line in output.getvalue().splitlines())
+            self.assertEqual(listed, dict(keys.COLOURS, off='#000000'))
 
     def test_input_validation(self):
-        self.assertEqual(keys.parse_colour('PiNk'), '#DFA0A0')
+        self.assertEqual(keys.parse_colour('PiNk'), '#FF0080')
+        self.assertEqual(keys.parse_colour('rose'), '#DFA0A0')
         self.assertEqual(keys.parse_colour('336699'), '#336699')
         self.assertEqual(keys.parse_colour('#aAbBcC'), '#AABBCC')
         self.assertEqual(keys.parse_colour('000000'), 'off')

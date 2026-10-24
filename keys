@@ -16,12 +16,15 @@ import tempfile
 import time
 
 COLOURS = {
-    'pink': '#DFA0A0', 'rose': '#DFA0A0', 'red': '#E05A5A',
-    'orange': '#F28C28', 'amber': '#D6A52A', 'yellow': '#D6C84A',
-    'lime': '#91B84A', 'green': '#55A878', 'teal': '#42A99A',
-    'cyan': '#45AFC2', 'blue': '#5C91D6', 'indigo': '#7566CF',
-    'purple': '#9B68C7', 'violet': '#B36AB5', 'magenta': '#D45A9C',
-    'white': '#E8E8E8',
+    'red': '#FF0000', 'crimson': '#DC143C', 'orange': '#FF8000',
+    'amber': '#FFBF00', 'gold': '#FFD700', 'yellow': '#FFFF00',
+    'lime': '#80FF00', 'chartreuse': '#BFFF00', 'green': '#00FF00',
+    'emerald': '#00C040', 'teal': '#008080', 'turquoise': '#00FFBF',
+    'cyan': '#00FFFF', 'sky-blue': '#00BFFF', 'azure': '#0080FF',
+    'blue': '#0000FF', 'royal-blue': '#4000FF', 'navy': '#000080',
+    'indigo': '#6000FF', 'purple': '#8000FF', 'violet': '#BF00FF',
+    'magenta': '#FF00FF', 'hot-pink': '#FF1493', 'pink': '#FF0080',
+    'rose': '#DFA0A0', 'white': '#FFFFFF',
 }
 SCENES = {1: 'still', 2: 'onboard2', 3: 'onboard3', 4: 'impact'}
 MODES = {1: 'solid', 2: 'onboard', 3: 'onboard', 4: 'ripple'}
@@ -37,6 +40,7 @@ THEME = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 
 HELP = '''Usage:
   keys <name|hex>       Set the shared base colour, retaining the scene
   keys-pink            Colour shortcut, like theme-pink
+  keys colours         List named colours and their RGB hex values
   keys off             Disable lighting in managed slots F1/F4
   keys theme [PATH]    Follow a JSON palette's accent; default: air-theme
   keys scene 1|4       Apply Still/Impact with the matching FN slot selected
@@ -50,6 +54,8 @@ HELP = '''Usage:
 
 Six-digit hex colours accept an optional # (quote it in the shell).
 Names: ''' + ', '.join(COLOURS) + '''
+Named colours are vivid RGB values; rose retains its original soft colour.
+White uses all three channels at full intensity. Keyboard brightness is preserved.
 
 F1 stays solid; F2/F3 use their saved onboard effects; F4 adds a fixed-colour
 ripple over the shared base. No complementary/rainbow colour cycling is added.
@@ -513,6 +519,10 @@ def main():
     try:
         if args == ['--watch']:
             watch()
+        elif args in (['colours'], ['colors'], ['list']):
+            for name, colour in COLOURS.items():
+                print(f'{name:<12} {colour}')
+            print(f'{"off":<12} #000000')
         elif args == ['status']:
             status()
         elif args == ['restore-defaults']:

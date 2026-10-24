@@ -43,6 +43,7 @@ if the access rule has not taken effect.
 ```sh
 keys-purple
 keys-pink
+keys colours
 keys '#336699'
 keys-off
 keys status
@@ -51,9 +52,38 @@ keys status
 `keys purple` and `keys-purple` are equivalent. Hex values accept an optional
 `#`; quote it in the shell. `off`, `black` and `000000` disable all lighting.
 
-Names: **pink, rose, red, orange, amber, yellow, lime, green, teal, cyan, blue,
-indigo, purple, violet, magenta, white**. These are soft theme colours; use
-`keys ff0000` for maximum red.
+Named colours now use vivid RGB values, including full-intensity red, green,
+and blue. **Rose keeps its original soft `#DFA0A0`.** White is full-intensity
+`#FFFFFF`. The keyboard's brightness setting still controls perceived brightness;
+actual shades depend on its LEDs.
+
+Run `keys colours` (also `keys colors` or `keys list`) to list the palette without
+changing the keyboard. Each name works as `keys NAME` and `keys-NAME`, including
+hyphenated names such as `keys-sky-blue`.
+
+| Name | RGB hex | Name | RGB hex |
+| --- | --- | --- | --- |
+| red | `#FF0000` | crimson | `#DC143C` |
+| orange | `#FF8000` | amber | `#FFBF00` |
+| gold | `#FFD700` | yellow | `#FFFF00` |
+| lime | `#80FF00` | chartreuse | `#BFFF00` |
+| green | `#00FF00` | emerald | `#00C040` |
+| teal | `#008080` | turquoise | `#00FFBF` |
+| cyan | `#00FFFF` | sky-blue | `#00BFFF` |
+| azure | `#0080FF` | blue | `#0000FF` |
+| royal-blue | `#4000FF` | navy | `#000080` |
+| indigo | `#6000FF` | purple | `#8000FF` |
+| violet | `#BF00FF` | magenta | `#FF00FF` |
+| hot-pink | `#FF1493` | pink | `#FF0080` |
+| rose | `#DFA0A0` | white | `#FFFFFF` |
+
+For other shades, supply any six-digit RGB hex value, from `000000` to `ffffff`
+(16,777,216 possible values; the LEDs may not visibly distinguish them all).
+`keys effect NAME` accepts the same palette for F4's reactive colour.
+
+Updating does not recolour an existing saved selection. Run a named command
+again, such as `keys blue`, to apply its new vivid value. Theme following still
+uses the palette file's exact accent and foreground values.
 
 Colour commands configure the base for F1 and F4. F2/F3 stay unmanaged; commands
 run there save settings for the next managed slot without changing their
